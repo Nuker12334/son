@@ -4,12 +4,17 @@ import threading
 import requests
 import random
 import string
+import subprocess
+import sys
 from flask import Flask, render_template_string, request
 from flask_socketio import SocketIO, emit
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 from selenium.common.exceptions import TimeoutException, NoSuchElementException
 
 # --- FLASK AND SOCKETIO SETUP ---
@@ -54,16 +59,16 @@ HTML_CONTENT = """
         <h1>Roblox Account Creator Control Panel</h1>
         <form id="automation-form">
             <div class="form-group">
-                <label for="target-username">Target Roblox Username (Optional - for auto-follow):</label>
-                <input type="text" id="target-username" placeholder="Enter user to follow after creation">
+                <label for="target-username">Target Roblox Username (Optional):</label>
+                <input type="text" id="target-username" placeholder="Enter user to follow">
             </div>
             <div class="form-group">
-                <label for="accounts-data">Base Names (one per line, optional - for username prefixes):</label>
-                <textarea id="accounts-data" placeholder="botbase1\nbotbase2"></textarea>
+                <label for="accounts-data">Base Names (one per line):</label>
+                <textarea id="accounts-data" placeholder="botbase1&#10;botbase2"></textarea>
             </div>
             <div class="form-group">
                 <label for="num-accounts">Number of accounts to create:</label>
-                <input type="number" id="num-accounts" min="1" max="20" value="5">
+                <input type="number" id="num-accounts" min="1" max="5" value="2">
             </div>
             <button type="submit" id="run-button">Create Accounts</button>
         </form>
@@ -78,7 +83,8 @@ HTML_CONTENT = """
             
             const socket = io({
                 transports: ['websocket', 'polling'],
-                reconnection: true
+                reconnection: true,
+                reconnectionAttempts: 5
             });
 
             function addLog(message, type = 'info') {
@@ -121,13 +127,9 @@ HTML_CONTENT = """
             });
 
             socket.on('disconnect', () => {
-                addLog('Disconnected from server', 'failure');
+                addLog('Process finished - You can close this window', 'info');
                 runButton.disabled = false;
                 runButton.textContent = 'Create Accounts';
-            });
-
-            socket.on('connect_error', (error) => {
-                addLog('Connection error: ' + error, 'failure');
             });
         });
     </script>
@@ -160,7 +162,7 @@ def solve_funcaptcha(page_url, site_key):
     
     try:
         # Create task
-        resp = requests.post("https://api.capsolver.com/createTask", json=payload)
+        resp = requests.post("https://api.capsolver.com/createTask", json=payload, timeout=30)
         if resp.status_code != 200:
             socketio.emit('status_update', {'message': f'CRITICAL: Capsolver API error - {resp.status_code}'})
             return None
@@ -175,7 +177,8 @@ def solve_funcaptcha(page_url, site_key):
         for i in range(30):
             time.sleep(5)
             status_resp = requests.post("https://api.capsolver.com/getTaskResult", 
-                                      json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id})
+                                      json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id},
+                                      timeout=30)
             status_result = status_resp.json()
             
             if status_result.get("status") == "ready":
@@ -185,7 +188,8 @@ def solve_funcaptcha(page_url, site_key):
                     return token
                     
             elif status_result.get("status") == "processing":
-                socketio.emit('status_update', {'message': f'Solving captcha... ({i+1}/30)'})
+                if i % 3 == 0:  # Update every 15 seconds
+                    socketio.emit('status_update', {'message': f'Solving captcha...'})
                 continue
             else:
                 break
@@ -201,7 +205,7 @@ def solve_funcaptcha(page_url, site_key):
 def run_automation_and_emit(target_username, accounts_data, num_accounts):
     """Main automation function"""
     successful_creates = 0
-    bases = [line.strip() for line in accounts_data.splitlines() if line.strip()] if accounts_data else []
+    bases = [line.strip() for line in accounts_data.splitlines() if line.strip()] if accounts_data else ["User"]
     created_accounts = []
 
     socketio.emit('status_update', {'message': f'Starting creation of {num_accounts} accounts...'})
@@ -210,36 +214,34 @@ def run_automation_and_emit(target_username, accounts_data, num_accounts):
         driver = None
         try:
             # Generate credentials
-            if bases and idx - 1 < len(bases):
-                base = bases[idx - 1]
-            else:
-                base = "Bot"
-                
-            rand_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            base = bases[(idx - 1) % len(bases)]
+            rand_str = ''.join(random.choices(string.ascii_lowercase + string.digits, k=5))
             username = f"{base}{rand_str}"
             password = ''.join(random.choices(string.ascii_letters + string.digits + "!@#$", k=12))
-            # Use a temporary email service in production
-            email = f"{username}@temp-mail.org"
+            # Use a temporary email service format
+            email = f"{username}@tempmail.com"
 
             socketio.emit('status_update', {'message': f'[{idx}/{num_accounts}] Creating: {username}'})
 
             # Configure Chrome options for Render
-            options = uc.ChromeOptions()
-            options.add_argument("--headless=new")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--disable-gpu")
-            options.add_argument("--window-size=1920,1080")
-            options.add_argument("--disable-setuid-sandbox")
-            options.add_argument("--disable-extensions")
-            options.add_argument("--disable-logging")
-            options.add_argument("--log-level=3")
-            options.add_argument("--silent")
-            options.add_argument("--blink-settings=imagesEnabled=false")
+            chrome_options = Options()
+            chrome_options.add_argument("--headless=new")
+            chrome_options.add_argument("--no-sandbox")
+            chrome_options.add_argument("--disable-dev-shm-usage")
+            chrome_options.add_argument("--disable-gpu")
+            chrome_options.add_argument("--window-size=1920,1080")
+            chrome_options.add_argument("--disable-setuid-sandbox")
+            chrome_options.add_argument("--disable-extensions")
+            chrome_options.add_argument("--disable-logging")
+            chrome_options.add_argument("--log-level=3")
+            chrome_options.add_argument("--silent")
+            chrome_options.add_argument("--blink-settings=imagesEnabled=false")
+            chrome_options.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
             
-            # Set Chrome binary location for Render
+            # Find Chrome binary
             chrome_paths = [
                 "/usr/bin/google-chrome",
+                "/usr/bin/google-chrome-stable",
                 "/usr/bin/chromium-browser",
                 "/usr/bin/chromium",
                 "/opt/render/project/.render/chrome/opt/google/chrome/google-chrome"
@@ -248,156 +250,149 @@ def run_automation_and_emit(target_username, accounts_data, num_accounts):
             chrome_found = False
             for path in chrome_paths:
                 if os.path.exists(path):
-                    options.binary_location = path
+                    chrome_options.binary_location = path
+                    socketio.emit('status_update', {'message': f'Found Chrome at: {path}'})
                     chrome_found = True
                     break
             
             if not chrome_found:
-                socketio.emit('status_update', {'message': 'CRITICAL: Chrome not found'})
+                # Try to find Chrome using which command
+                try:
+                    result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
+                    if result.returncode == 0:
+                        chrome_path = result.stdout.strip()
+                        chrome_options.binary_location = chrome_path
+                        socketio.emit('status_update', {'message': f'Found Chrome at: {chrome_path}'})
+                        chrome_found = True
+                except:
+                    pass
+            
+            if not chrome_found:
+                socketio.emit('status_update', {'message': 'CRITICAL: Chrome not found. Please check build script.'})
                 continue
 
-            # Initialize driver
-            driver = uc.Chrome(options=options, version_main=120)  # Specify Chrome version
-            wait = WebDriverWait(driver, 30)
+            # Initialize driver with automatic driver management
+            service = Service(ChromeDriverManager().install())
+            driver = webdriver.Chrome(service=service, options=chrome_options)
+            
+            # Set page load timeout
+            driver.set_page_load_timeout(30)
+            
+            wait = WebDriverWait(driver, 20)
 
-            # Navigate to Roblox
+            # Navigate to Roblox signup page directly
+            socketio.emit('status_update', {'message': 'Loading Roblox signup page...'})
             driver.get("https://www.roblox.com/")
-            socketio.emit('status_update', {'message': f'Loaded Roblox homepage'})
-            time.sleep(random.uniform(3, 6))
+            time.sleep(3)
 
-            # Click signup button
+            # Click signup button or go directly to signup
             try:
-                signup_btn = wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Sign Up")))
+                signup_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, 'signup')]")))
                 signup_btn.click()
             except:
-                try:
-                    signup_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@href, 'signup')]")))
-                    signup_btn.click()
-                except:
-                    socketio.emit('status_update', {'message': 'FAILURE: Could not find signup button'})
-                    continue
+                # Direct navigation to signup
+                driver.get("https://www.roblox.com/signup")
+            
+            time.sleep(2)
 
-            time.sleep(random.uniform(2, 4))
-
-            # Fill form
+            # Fill the signup form
             try:
-                # Username
-                username_field = wait.until(EC.presence_of_element_located((By.NAME, "username")))
-                username_field.send_keys(username)
+                # Wait for form to load
+                wait.until(EC.presence_of_element_located((By.XPATH, "//input[@type='text' or @name='username']")))
                 
-                # Password
-                password_field = driver.find_element(By.NAME, "password")
-                password_field.send_keys(password)
+                # Find and fill username field
+                username_fields = driver.find_elements(By.XPATH, "//input[@type='text' or @name='username' or @placeholder*='[Uu]sername']")
+                if username_fields:
+                    username_fields[0].clear()
+                    username_fields[0].send_keys(username)
                 
-                # Birthday (select random date for 13+)
+                # Find and fill password field
+                password_fields = driver.find_elements(By.XPATH, "//input[@type='password' or @name='password' or @placeholder*='[Pp]assword']")
+                if password_fields:
+                    password_fields[0].clear()
+                    password_fields[0].send_keys(password)
+                
+                # Birthday dropdowns
                 from selenium.webdriver.support.ui import Select
                 
                 # Month
-                month_select = Select(driver.find_element(By.NAME, "birthdayMonth"))
-                month_select.select_by_index(random.randint(1, 12))
+                month_selects = driver.find_elements(By.XPATH, "//select[contains(@name, 'month') or contains(@id, 'Month')]")
+                if month_selects:
+                    Select(month_selects[0]).select_by_index(random.randint(1, 12))
                 
                 # Day
-                day_select = Select(driver.find_element(By.NAME, "birthdayDay"))
-                day_select.select_by_index(random.randint(1, 28))
+                day_selects = driver.find_elements(By.XPATH, "//select[contains(@name, 'day') or contains(@id, 'Day')]")
+                if day_selects:
+                    Select(day_selects[0]).select_by_index(random.randint(1, 28))
                 
-                # Year (make sure user is 13+)
-                year_select = Select(driver.find_element(By.NAME, "birthdayYear"))
-                current_year = 2024
-                year_options = [int(opt.get_attribute("value")) for opt in year_select.options if opt.get_attribute("value").isdigit()]
-                valid_years = [y for y in year_options if y <= current_year - 13]
-                if valid_years:
-                    year_select.select_by_value(str(random.choice(valid_years)))
+                # Year
+                year_selects = driver.find_elements(By.XPATH, "//select[contains(@name, 'year') or contains(@id, 'Year')]")
+                if year_selects:
+                    # Select year for someone 13+ (before 2011)
+                    Select(year_selects[0]).select_by_value(str(random.randint(1990, 2010)))
                 
-                # Gender (optional)
-                try:
-                    gender_male = driver.find_element(By.XPATH, "//span[text()='Male']")
-                    gender_male.click()
-                except:
-                    pass
-                    
             except Exception as e:
-                socketio.emit('status_update', {'message': f'FAILURE: Form filling error - {str(e)}'})
-                continue
+                socketio.emit('status_update', {'message': f'Form filling warning: {str(e)}'})
 
-            # Solve CAPTCHA
-            site_key = "476068BF-9607-4799-B53D-966BE98E2B81"  # Roblox FunCaptcha key
-            token = solve_funcaptcha(driver.current_url, site_key)
-            
-            if not token:
-                socketio.emit('status_update', {'message': 'FAILURE: Could not solve captcha'})
-                continue
-
-            # Inject token
+            # Check for captcha
             try:
-                driver.execute_script(f'''
-                    var input = document.createElement('input');
-                    input.type = 'hidden';
-                    input.name = 'fc-token';
-                    input.value = '{token}';
-                    document.querySelector('form').appendChild(input);
-                ''')
-                time.sleep(1)
+                if "funcaptcha" in driver.page_source.lower() or "arkose" in driver.page_source.lower():
+                    socketio.emit('status_update', {'message': 'Captcha detected, solving...'})
+                    site_key = "476068BF-9607-4799-B53D-966BE98E2B81"
+                    token = solve_funcaptcha(driver.current_url, site_key)
+                    
+                    if token:
+                        # Inject token
+                        driver.execute_script(f'''
+                            var input = document.createElement('input');
+                            input.type = 'hidden';
+                            input.name = 'fc-token';
+                            input.value = '{token}';
+                            document.querySelector('form').appendChild(input);
+                        ''')
+                        time.sleep(1)
             except:
                 pass
 
-            # Submit form
+            # Try to submit the form
             try:
-                submit_btn = driver.find_element(By.XPATH, "//button[@type='submit']")
-                submit_btn.click()
-            except:
-                try:
-                    submit_btn = driver.find_element(By.XPATH, "//button[contains(text(), 'Sign Up')]")
-                    submit_btn.click()
-                except:
-                    socketio.emit('status_update', {'message': 'FAILURE: Could not find submit button'})
-                    continue
+                submit_buttons = driver.find_elements(By.XPATH, "//button[@type='submit'] | //input[@type='submit'] | //button[contains(text(), 'Sign Up')]")
+                if submit_buttons:
+                    submit_buttons[0].click()
+                    socketio.emit('status_update', {'message': 'Form submitted'})
+            except Exception as e:
+                socketio.emit('status_update', {'message': f'Submit warning: {str(e)}'})
 
-            # Wait for success (check URL or presence of home page elements)
+            # Wait for potential success
             time.sleep(5)
-            current_url = driver.current_url
             
-            if "home" in current_url or "games" in current_url:
-                socketio.emit('status_update', {'message': f'SUCCESS: Created account - Username: {username}, Password: {password}'})
+            # Check if we're still on signup page
+            current_url = driver.current_url
+            if "home" in current_url or "games" in current_url or "dashboard" in current_url:
+                socketio.emit('status_update', {'message': f'SUCCESS: Account created - {username}:{password}'})
                 created_accounts.append(f"{username}:{password}")
                 successful_creates += 1
-
-                # Optional: Auto-follow target
-                if target_username:
-                    try:
-                        # Search for user
-                        driver.get(f"https://www.roblox.com/search/users?keyword={target_username}")
-                        time.sleep(3)
-                        
-                        # Click on profile
-                        profile_link = wait.until(EC.element_to_be_clickable((By.XPATH, f"//a[contains(@href, 'users') and contains(text(), '{target_username}')]")))
-                        profile_link.click()
-                        time.sleep(2)
-                        
-                        # Click follow button
-                        follow_btn = wait.until(EC.element_to_be_clickable((By.XPATH, "//button[contains(text(), 'Follow')]")))
-                        follow_btn.click()
-                        socketio.emit('status_update', {'message': f'SUCCESS: Followed {target_username}'})
-                    except Exception as e:
-                        socketio.emit('status_update', {'message': f'Could not follow target: {str(e)}'})
             else:
-                socketio.emit('status_update', {'message': f'FAILURE: Account creation might have failed - check manually'})
+                socketio.emit('status_update', {'message': f'Account creation attempted for {username}. Check manually.'})
 
         except Exception as e:
-            socketio.emit('status_update', {'message': f'FAILURE: Account {idx} error - {str(e)[:100]}'})
+            socketio.emit('status_update', {'message': f'FAILURE: Account {idx} error - {str(e)}'})
         finally:
             if driver:
                 try:
                     driver.quit()
                 except:
                     pass
-            # Random delay between accounts
-            time.sleep(random.uniform(10, 20))
+            # Delay between accounts
+            if idx < num_accounts:
+                time.sleep(random.uniform(10, 15))
 
     # Final summary
-    summary = f"FINISHED! Successfully created {successful_creates}/{num_accounts} accounts"
+    summary = f"FINISHED! Created {successful_creates}/{num_accounts} accounts"
     if created_accounts:
-        summary += f"\nAccounts: {', '.join(created_accounts)}"
+        summary += f"\nAccounts:\n" + "\n".join(created_accounts)
     socketio.emit('status_update', {'message': summary})
+    socketio.emit('disconnect')  # Signal completion
 
 # --- SOCKETIO HANDLER ---
 @socketio.on('run_script')
@@ -405,12 +400,7 @@ def handle_run_script(data):
     """Handle incoming run requests"""
     target_username = data.get('target_username', '').strip()
     accounts_data = data.get('accounts', '')
-    num_accounts = data.get('num_accounts', 5)
-    
-    # Limit maximum accounts
-    if num_accounts > 20:
-        num_accounts = 20
-        socketio.emit('status_update', {'message': 'Limited to 20 accounts maximum'})
+    num_accounts = min(data.get('num_accounts', 2), 5)  # Max 5 accounts
     
     # Run in background thread
     thread = threading.Thread(
@@ -427,7 +417,20 @@ def index():
 
 @app.route('/health')
 def health():
-    return {'status': 'healthy'}, 200
+    return {'status': 'healthy', 'chrome': check_chrome()}, 200
+
+def check_chrome():
+    """Check if Chrome is installed"""
+    chrome_paths = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium"
+    ]
+    for path in chrome_paths:
+        if os.path.exists(path):
+            return True
+    return False
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8080))
